@@ -2432,7 +2432,29 @@ class ClaudeBar(rumps.App):
         """Runs once after the run loop is active, then stops itself."""
         _timer.stop()
         self._hook_status_button()
+        if os.environ.get("AQB_SELFTEST") == "1":
+            self._run_key_selftest()
         self._check_widget_status()
+
+    def _run_key_selftest(self):
+        """Gated diagnostic: open the panel, log whether it took key focus,
+        then close it. Only runs when AQB_SELFTEST=1 so it never blinks in
+        normal use."""
+        from Foundation import NSTimer
+        def _open(_t):
+            try:
+                log.info("SELFTEST: opening panel")
+                self._panel.show()
+            except Exception as e:
+                log.info("SELFTEST: show failed: %s", e)
+            def _close(_t2):
+                try:
+                    self._panel.dismiss()
+                    log.info("SELFTEST: closed panel")
+                except Exception:
+                    pass
+            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(1.2, False, _close)
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(2.5, False, _open)
 
     def _hook_status_button(self):
         """Replace NSMenu with panel toggle on the status item button click."""
