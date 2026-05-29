@@ -1339,7 +1339,15 @@ class _UsagePanel:
             # app is active), then make it key and force it front.
             self._panel.setAlphaValue_(0.0)
             from AppKit import NSApplication, NSAnimationContext
-            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            app = NSApplication.sharedApplication()
+            app.activateIgnoringOtherApps_(True)
+            # Modern (macOS 14+) activation; the deprecated call above is a
+            # no-op for background apps on recent macOS.
+            if hasattr(app, "activate"):
+                try:
+                    app.activate()
+                except Exception:
+                    pass
             self._panel.makeKeyAndOrderFront_(None)
             self._panel.makeKeyWindow()
             ctx = NSAnimationContext.currentContext()
@@ -1347,6 +1355,21 @@ class _UsagePanel:
             self._panel.animator().setAlphaValue_(1.0)
             self._visible = True
             self._install_dismiss_monitors()
+            # DIAGNOSTIC (temporary): did the panel actually take key focus?
+            try:
+                log.info("PANEL_KEY immediate isKey=%s appActive=%s",
+                         self._panel.isKeyWindow(), app.isActive())
+                from Foundation import NSTimer
+                def _log_key(_t):
+                    try:
+                        log.info("PANEL_KEY delayed isKey=%s appActive=%s",
+                                 self._panel.isKeyWindow(),
+                                 NSApplication.sharedApplication().isActive())
+                    except Exception as e:
+                        log.info("PANEL_KEY delayed failed: %s", e)
+                NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.3, False, _log_key)
+            except Exception:
+                pass
         except Exception:
             log.debug("_UsagePanel.show failed", exc_info=True)
 
@@ -1601,12 +1624,16 @@ class _UsagePanel:
             elements.append(('provider_header', y, 18, 'Claude', '#D97757', ''))
             y += 18 + 6
 
-            # Rows -- each carries its own reset time so the weekly (7-day)
-            # refresh is visible alongside the 5-hour session.
+            # Rows -- full-width bar, then a compact reset line below each so
+            # the weekly (7-day) refresh is visible without shrinking the bar.
             for row in [data.session, data.weekly_all, data.weekly_sonnet]:
                 if row:
-                    elements.append(('limit_row', y, 20, row, '#D97757', row.reset_str))
-                    y += 20 + self.ROW_GAP
+                    elements.append(('limit_row', y, 20, row, '#D97757'))
+                    y += 20 + 1
+                    if row.reset_str:
+                        elements.append(('reset_line', y, 13, row.reset_str))
+                        y += 13 + 1
+                    y += self.ROW_GAP - 1
 
             # ETA (burn-rate estimate tracks the current 5-hour session)
             eta = _calc_eta_minutes(history, "claude")
@@ -1739,13 +1766,19 @@ class _UsagePanel:
                 )
 
             elif kind == 'limit_row':
-                row, color_hex = elem[3], elem[4]
-                reset_text = elem[5] if len(elem) > 5 else ""
+                _, _, _, row, color_hex = elem
                 self._render_limit_row(
                     doc, PAD, real_y, inner, h, row, color_hex,
                     NSView, NSTextField, NSFont, NSColor, NSMakeRect,
                     NSTextAlignmentLeft, NSTextAlignmentRight, Quartz,
-                    reset_text=reset_text,
+                )
+
+            elif kind == 'reset_line':
+                _, _, _, reset_str = elem
+                self._render_small_text(
+                    doc, PAD, real_y, inner, h, reset_str,
+                    NSTextField, NSFont, NSColor, NSMakeRect,
+                    size=10, align=NSTextAlignmentRight,
                 )
 
             elif kind == 'eta_line':
@@ -1879,17 +1912,12 @@ class _UsagePanel:
 
     def _render_limit_row(self, parent, x, y, w, h, row, color_hex,
                           NSView, NSTextField, NSFont, NSColor, NSMakeRect,
-                          NSTextAlignmentLeft, NSTextAlignmentRight, Quartz,
-                          reset_text=""):
-        """Render: label + progress bar + pct% text, plus an optional
-        right-aligned reset time (e.g. "resets in 14h 50m") so per-limit
-        refresh times are visible. The bar shrinks only when a reset is shown,
-        leaving rows without one unchanged."""
+                          NSTextAlignmentLeft, NSTextAlignmentRight, Quartz):
+        """Render: label + progress bar + pct% text."""
         label_w = 80
-        pct_w = 36 if reset_text else 40
-        reset_w = 104 if reset_text else 0
+        pct_w = 40
         bar_x = x + label_w + 4
-        bar_w = w - label_w - 4 - pct_w - reset_w - 4
+        bar_w = w - label_w - pct_w - 8
         bar_y = y + (h - self.PROGRESS_H) / 2
 
         # Label
@@ -1926,9 +1954,8 @@ class _UsagePanel:
             fill.layer().setMasksToBounds_(True)
             parent.addSubview_(fill)
 
-        # Percentage text -- sits just left of the reset column (if any)
-        pct_x = x + w - reset_w - pct_w
-        pct_lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(pct_x, y, pct_w, h))
+        # Percentage text
+        pct_lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(x + w - pct_w, y, pct_w, h))
         pct_lbl.setStringValue_(f"{row.pct}%")
         pct_lbl.setBezeled_(False)
         pct_lbl.setDrawsBackground_(False)
@@ -1939,22 +1966,9 @@ class _UsagePanel:
         pct_lbl.setTextColor_(NSColor.labelColor())
         parent.addSubview_(pct_lbl)
 
-        # Reset time (right-aligned), e.g. "resets in 14h 50m"
-        if reset_text:
-            rt = NSTextField.alloc().initWithFrame_(NSMakeRect(x + w - reset_w, y, reset_w, h))
-            rt.setStringValue_(reset_text)
-            rt.setBezeled_(False)
-            rt.setDrawsBackground_(False)
-            rt.setEditable_(False)
-            rt.setSelectable_(False)
-            rt.setAlignment_(NSTextAlignmentRight)
-            rt.setFont_(NSFont.systemFontOfSize_(10))
-            rt.setTextColor_(NSColor.secondaryLabelColor())
-            parent.addSubview_(rt)
-
     def _render_small_text(self, parent, x, y, w, h, text,
                            NSTextField, NSFont, NSColor, NSMakeRect,
-                           size=10, weight=0.0):
+                           size=10, weight=0.0, align=None):
         """Render a small secondary-colored text line."""
         lbl = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
         lbl.setStringValue_(text)
@@ -1962,6 +1976,8 @@ class _UsagePanel:
         lbl.setDrawsBackground_(False)
         lbl.setEditable_(False)
         lbl.setSelectable_(False)
+        if align is not None:
+            lbl.setAlignment_(align)
         lbl.setFont_(NSFont.systemFontOfSize_weight_(size, weight))
         lbl.setTextColor_(NSColor.secondaryLabelColor())
         parent.addSubview_(lbl)
