@@ -1311,6 +1311,8 @@ class _UsagePanel:
         self._handler = None         # ObjC click handler instance
         self._scroll = None
         self._built = False
+        self._click_monitor = None   # global mouse-down monitor: dismiss on outside click
+        self._key_monitor = None     # local key-down monitor: dismiss on Esc
 
     # -- public API -----------------------------------------------------------
 
@@ -1340,11 +1342,16 @@ class _UsagePanel:
             ctx.setDuration_(0.12)
             self._panel.animator().setAlphaValue_(1.0)
             self._visible = True
+            self._install_dismiss_monitors()
         except Exception:
             log.debug("_UsagePanel.show failed", exc_info=True)
 
     def dismiss(self):
         """Hide the panel with a quick fade-out."""
+        if not self._visible:
+            return
+        self._visible = False
+        self._remove_dismiss_monitors()
         try:
             if self._panel:
                 from AppKit import NSAnimationContext
@@ -1363,7 +1370,59 @@ class _UsagePanel:
         except Exception:
             if self._panel:
                 self._panel.orderOut_(None)
-        self._visible = False
+
+    def _install_dismiss_monitors(self):
+        """Dismiss the panel on an outside click or the Esc key.
+
+        - A *global* mouse-down monitor only observes events delivered to OTHER
+          applications (the desktop, another window, a different menu bar item),
+          so any click it sees means the user clicked off the panel. Clicks
+          inside the panel go to our own process and never reach it. This is
+          more reliable for a borderless, accessory-app panel than relying on
+          ``resignKeyWindow`` alone.
+        - A *local* key-down monitor catches Esc while the panel is key and
+          dismisses it, swallowing the event so it doesn't beep.
+        """
+        try:
+            from AppKit import NSEvent
+            if self._click_monitor is None:
+                # NSEventMaskLeftMouseDown (1<<1) | NSEventMaskRightMouseDown (1<<3)
+                click_mask = (1 << 1) | (1 << 3)
+
+                def _on_outside_click(_event):
+                    self.dismiss()
+
+                self._click_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    click_mask, _on_outside_click
+                )
+            if self._key_monitor is None:
+                key_mask = 1 << 10  # NSEventMaskKeyDown
+
+                def _on_key(event):
+                    if event.keyCode() == 53:  # Esc
+                        self.dismiss()
+                        return None  # swallow
+                    return event
+
+                self._key_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                    key_mask, _on_key
+                )
+        except Exception:
+            log.debug("_install_dismiss_monitors failed", exc_info=True)
+
+    def _remove_dismiss_monitors(self):
+        """Tear down the outside-click and Esc monitors, if installed."""
+        try:
+            from AppKit import NSEvent
+            for attr in ("_click_monitor", "_key_monitor"):
+                mon = getattr(self, attr, None)
+                if mon is not None:
+                    NSEvent.removeMonitor_(mon)
+                setattr(self, attr, None)
+        except Exception:
+            log.debug("_remove_dismiss_monitors failed", exc_info=True)
+            self._click_monitor = None
+            self._key_monitor = None
 
     def refresh(self):
         """Rebuild the panel content with current data."""
