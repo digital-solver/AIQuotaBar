@@ -1313,7 +1313,6 @@ class _UsagePanel:
         self._scroll = None
         self._built = False
         self._click_monitor = None   # global mouse-down monitor: dismiss on outside click
-        self._key_monitor = None     # local key-down monitor: dismiss on Esc
 
     # -- public API -----------------------------------------------------------
 
@@ -1334,42 +1333,16 @@ class _UsagePanel:
             self._ensure_built()
             self.refresh()
             self._position_panel()
-            # Fade-in animation. Activate the app FIRST so the panel can take
-            # key focus (an accessory app's window won't become key unless the
-            # app is active), then make it key and force it front.
+            # Fade-in animation
             self._panel.setAlphaValue_(0.0)
-            from AppKit import NSApplication, NSAnimationContext
-            app = NSApplication.sharedApplication()
-            app.activateIgnoringOtherApps_(True)
-            # Modern (macOS 14+) activation; the deprecated call above is a
-            # no-op for background apps on recent macOS.
-            if hasattr(app, "activate"):
-                try:
-                    app.activate()
-                except Exception:
-                    pass
             self._panel.makeKeyAndOrderFront_(None)
-            self._panel.makeKeyWindow()
+            from AppKit import NSApplication, NSAnimationContext
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             ctx = NSAnimationContext.currentContext()
             ctx.setDuration_(0.12)
             self._panel.animator().setAlphaValue_(1.0)
             self._visible = True
-            self._install_dismiss_monitors()
-            # DIAGNOSTIC (temporary): did the panel actually take key focus?
-            try:
-                log.info("PANEL_KEY immediate isKey=%s appActive=%s",
-                         self._panel.isKeyWindow(), app.isActive())
-                from Foundation import NSTimer
-                def _log_key(_t):
-                    try:
-                        log.info("PANEL_KEY delayed isKey=%s appActive=%s",
-                                 self._panel.isKeyWindow(),
-                                 NSApplication.sharedApplication().isActive())
-                    except Exception as e:
-                        log.info("PANEL_KEY delayed failed: %s", e)
-                NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.3, False, _log_key)
-            except Exception:
-                pass
+            self._install_click_monitor()
         except Exception:
             log.debug("_UsagePanel.show failed", exc_info=True)
 
@@ -1378,7 +1351,7 @@ class _UsagePanel:
         if not self._visible:
             return
         self._visible = False
-        self._remove_dismiss_monitors()
+        self._remove_click_monitor()
         try:
             if self._panel:
                 from AppKit import NSAnimationContext
@@ -1398,58 +1371,44 @@ class _UsagePanel:
             if self._panel:
                 self._panel.orderOut_(None)
 
-    def _install_dismiss_monitors(self):
-        """Dismiss the panel on an outside click or the Esc key.
+    def _install_click_monitor(self):
+        """Dismiss the panel when the user clicks anywhere outside it.
 
-        - A *global* mouse-down monitor only observes events delivered to OTHER
-          applications (the desktop, another window, a different menu bar item),
-          so any click it sees means the user clicked off the panel. Clicks
-          inside the panel go to our own process and never reach it. This is
-          more reliable for a borderless, accessory-app panel than relying on
-          ``resignKeyWindow`` alone.
-        - A *local* key-down monitor catches Esc while the panel is key and
-          dismisses it, swallowing the event so it doesn't beep.
+        A global mouse-down monitor only observes events delivered to OTHER
+        applications (the desktop, another window, a different menu bar item),
+        so any click it sees means the user clicked off the panel. Clicks
+        inside the panel go to our own process and never reach it, so the
+        panel's own controls keep working. This works without the panel being
+        the key window (an accessory app can't reliably take key focus on
+        recent macOS).
         """
+        if self._click_monitor is not None:
+            return
         try:
             from AppKit import NSEvent
-            if self._click_monitor is None:
-                # NSEventMaskLeftMouseDown (1<<1) | NSEventMaskRightMouseDown (1<<3)
-                click_mask = (1 << 1) | (1 << 3)
+            # NSEventMaskLeftMouseDown (1<<1) | NSEventMaskRightMouseDown (1<<3)
+            click_mask = (1 << 1) | (1 << 3)
 
-                def _on_outside_click(_event):
-                    self.dismiss()
+            def _on_outside_click(_event):
+                self.dismiss()
 
-                self._click_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-                    click_mask, _on_outside_click
-                )
-            if self._key_monitor is None:
-                key_mask = 1 << 10  # NSEventMaskKeyDown
-
-                def _on_key(event):
-                    if event.keyCode() == 53:  # Esc
-                        self.dismiss()
-                        return None  # swallow
-                    return event
-
-                self._key_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
-                    key_mask, _on_key
-                )
+            self._click_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                click_mask, _on_outside_click
+            )
         except Exception:
-            log.debug("_install_dismiss_monitors failed", exc_info=True)
+            log.debug("_install_click_monitor failed", exc_info=True)
 
-    def _remove_dismiss_monitors(self):
-        """Tear down the outside-click and Esc monitors, if installed."""
+    def _remove_click_monitor(self):
+        """Tear down the outside-click monitor, if installed."""
+        if self._click_monitor is None:
+            return
         try:
             from AppKit import NSEvent
-            for attr in ("_click_monitor", "_key_monitor"):
-                mon = getattr(self, attr, None)
-                if mon is not None:
-                    NSEvent.removeMonitor_(mon)
-                setattr(self, attr, None)
+            NSEvent.removeMonitor_(self._click_monitor)
         except Exception:
-            log.debug("_remove_dismiss_monitors failed", exc_info=True)
+            log.debug("_remove_click_monitor failed", exc_info=True)
+        finally:
             self._click_monitor = None
-            self._key_monitor = None
 
     def refresh(self):
         """Rebuild the panel content with current data."""
@@ -1492,9 +1451,6 @@ class _UsagePanel:
         panel.setMovableByWindowBackground_(False)
         panel.setWorksWhenModal_(True)
         panel.setHidesOnDeactivate_(False)
-        # Take key focus so the panel receives Esc / key events (otherwise the
-        # keystroke falls through to whatever app was previously focused).
-        panel.setBecomesKeyOnlyIfNeeded_(False)
         panel._dismiss_callback = self.dismiss
 
         content = panel.contentView()
@@ -2432,29 +2388,7 @@ class ClaudeBar(rumps.App):
         """Runs once after the run loop is active, then stops itself."""
         _timer.stop()
         self._hook_status_button()
-        if os.environ.get("AQB_SELFTEST") == "1":
-            self._run_key_selftest()
         self._check_widget_status()
-
-    def _run_key_selftest(self):
-        """Gated diagnostic: open the panel, log whether it took key focus,
-        then close it. Only runs when AQB_SELFTEST=1 so it never blinks in
-        normal use."""
-        from Foundation import NSTimer
-        def _open(_t):
-            try:
-                log.info("SELFTEST: opening panel")
-                self._panel.show()
-            except Exception as e:
-                log.info("SELFTEST: show failed: %s", e)
-            def _close(_t2):
-                try:
-                    self._panel.dismiss()
-                    log.info("SELFTEST: closed panel")
-                except Exception:
-                    pass
-            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(1.2, False, _close)
-        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(2.5, False, _open)
 
     def _hook_status_button(self):
         """Replace NSMenu with panel toggle on the status item button click."""
