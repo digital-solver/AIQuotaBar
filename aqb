@@ -1,0 +1,49 @@
+#!/bin/bash
+# aqb — manage the AIQuotaBar menu-bar app (claude_bar.py via launchd)
+#
+#   aqb            show status (running? last reading? recent restarts/heals)
+#   aqb restart    clean relaunch through launchd (the correct way to fix it)
+#   aqb logs       live-tail the log, filtered to restarts/heals/errors
+#
+# The menu-bar item is the LaunchAgent `com.claudebar`. NEVER restart it with
+# the app's own restart (that re-execs in place and is what made it vanish);
+# always relaunch via launchd, which `aqb restart` does.
+
+set -euo pipefail
+LABEL="com.claudebar"
+LOG="$HOME/.claude_bar.log"
+TARGET="gui/$(id -u)/$LABEL"
+
+case "${1:-status}" in
+  restart|fix|kick)
+    echo "Restarting $LABEL via launchd…"
+    launchctl kickstart -k "$TARGET"
+    sleep 3
+    pid=$(pgrep -f claude_bar.py | head -1 || true)
+    echo "Done. ${pid:+now running as PID $pid.} Look for the ◆ item in the menu bar."
+    ;;
+
+  logs|log|tail)
+    echo "Tailing $LOG (Ctrl-C to stop)…"
+    tail -f "$LOG" | grep --line-buffered -iE "restarting|self-heal|unhealthy|restored|detached|ERROR|bar title set"
+    ;;
+
+  status|"")
+    pid=$(pgrep -f claude_bar.py | head -1 || true)
+    if [ -n "$pid" ]; then
+      start=$(ps -o lstart= -p "$pid" | xargs)
+      echo "● running   PID $pid   since $start"
+    else
+      echo "○ NOT running — run: aqb restart"
+    fi
+    title=$(grep "bar title set" "$LOG" 2>/dev/null | tail -1 | sed -E 's/.*bar title set: //') || true
+    [ -n "${title:-}" ] && echo "  last bar reading: $title"
+    echo "  recent restarts / heals:"
+    grep -iE "restarting|self-heal|unhealthy|restored" "$LOG" 2>/dev/null | tail -5 | sed 's/^/    /' \
+      || echo "    (none logged — good)"
+    echo "  log: $LOG"
+    ;;
+
+  *)
+    echo "usage: aqb [status|restart|logs]"; exit 1 ;;
+esac
